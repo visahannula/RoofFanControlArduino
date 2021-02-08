@@ -4,12 +4,15 @@
  * This code has been made for controlling Vilpe Eco 220P roof fan
  * with Arduino UNO (Atmega328P).
  * 
- * Arduino controls fan with PWM to NPN transistor.
+ * Arduino controls fan with PWM to NPN transistor (switch mode).
  * 
  * PWM duty is controlled using potentiometer (note: PWM uses Timer2).
  * 
  * LCD can be used to display the set speed value and the tacho signal
- * coming from the fan circuit (actual spinning RPM)
+ * coming from the fan circuit (actual spinning RPM).
+ * 
+ * Through serial a bit more information is provided about the current
+ * operating values.
  * 
  * https://www.vilpe.com/product/e220p-o160-500-roof-fan/
  * 
@@ -34,11 +37,9 @@
  * - Timer/Counter Control Registers TCCRnA and TCCRnB hold the main control bits for the timer
  * - Output Compare Registers OCRnA and OCRnB set the levels at which outputs A and B will be affected
  * 
- * This code has been made for Arduino UNO
- * 
- * The Arduino uses Timer 0 internally for the millis() and delay() functions, so be warned that
- * changing the frequency of this timer will cause those functions to be erroneous. Using the PWM
- * outputs is safe if you don't change the frequency, though.
+ * General note: The Arduino uses Timer 0 internally for the millis() and delay() functions,
+ * so be warned that changing the frequency of this timer will cause those functions to be erroneous.
+ * Using the PWM outputs is safe if you don't change the frequency, though.
  * 
  * Timer output Arduino output  Chip pin    Pin name
  * OC0A	        6	            12          PD6
@@ -48,8 +49,10 @@
  * OC2A	        11	            17          PB3
  * OC2B	        3	            5           PD3
  * 
+ * This code has been made for Arduino UNO.
+ * In this sketch the PWM is connected to PIN 3 in Arduino (OC2B)
+ * and so controlled with OCR2B.
  * */
-
 
 
 #include <Arduino.h>
@@ -70,13 +73,9 @@ uint16_t tachoPulses_non_vol = 0; // For reducing access to volatile value
 unsigned long tachoMillis = 0;
 
 uint8_t ledState = LOW;
-uint8_t fanState = HIGH;
 
-uint8_t fanDuty = 255; // timer val for PWM
-uint8_t fanDutyDisplay = 0; // 0-100 for display
-
-uint16_t potVal = 0;    // potentiometer value
-uint16_t currPotVal = 0; // pot lates val
+uint16_t potValOld = 0;    // potentiometer value
+uint16_t potValNew = 0; // pot lates val
 
 char lcdRow0Empty [17] = "Nopeus:         ";
 char lcdRow1Empty [17] = "RPM:            ";
@@ -101,11 +100,28 @@ char lcdRow1Empty [17] = "RPM:            ";
 //LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
 LiquidCrystal lcd(PIN_LCD_RS, PIN_LCD_EN, PIN_LCD_DB4, PIN_LCD_DB5, PIN_LCD_DB6, PIN_LCD_DB7);
 
+struct Fan {
+    uint8_t fanPWMPin;
+    uint8_t fanState;
+    uint8_t fanDuty; // timer val for PWM
+    uint8_t fanDutyDisplay; // 0-100 for display
+    unsigned long dutyUpdateMillis;
+};
+
+struct Fan roofFan;
+
 
 // SETUP
 void setup() {
     pinMode(CONTROL_PIN_FAN, OUTPUT);
-    digitalWrite(CONTROL_PIN_FAN, LOW);
+
+    roofFan.fanPWMPin = CONTROL_PIN_FAN;
+    roofFan.fanState = HIGH;
+    roofFan.fanDuty = 255; // timer val for PWM
+    roofFan.fanDutyDisplay = 0; // 0-100 for display
+    roofFan.dutyUpdateMillis = millis() + 2000; // keep high for 2 sec
+
+    digitalWrite(roofFan.fanPWMPin, HIGH);
 
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
@@ -114,7 +130,7 @@ void setup() {
     // https://playground.arduino.cc/Main/TimerPWMCheatsheet/
     TCCR2A = _BV(COM2B1) | _BV(WGM20);
     TCCR2B = _BV(CS21);
-    OCR2B = 255;
+    OCR2B = roofFan.fanDuty;
 
     /*
     Explanation:
@@ -127,8 +143,8 @@ void setup() {
     lcd.begin(16, 2);
     lcd.print(F("START"));
 
-    ledMillis = millis();
-    tachoMillis = millis();
+    ledMillis = millis(); // Internal led control
+    tachoMillis = millis(); //
 
     Serial.setTimeout(200);
     Serial.begin(115200);
@@ -149,28 +165,30 @@ void setup() {
 // LOOP
 void loop() {
     currMillis = millis();
-    if (currMillis > ledMillis + 300) {
+
+    // READ CURRENT POTENTIOMETER VALUE
+    if (currMillis > ledMillis + 200) { // read values rate
         ledMillis = currMillis;
         toggleLED(LED_BUILTIN);
 
-        // Read potentiometer and act if changed
-        if (potVal != *getPotValSmooth(&currPotVal, PIN_POT)) {
-            potVal = currPotVal;
-            fanDuty = potVal >> 2; // convert 1024 to 255
-
-            unsigned char fanDutyDisplay = map(fanDuty, 0, 255, 100, 0); // show as 0-100
-
-            setFanSpeed(CONTROL_PIN_FAN, &fanDuty);
-            printFanSpeed(&fanDutyDisplay);
+        // Read new value from potentiometer and store and show if changed
+        if (potValOld != *getPotValSmooth(&potValNew, PIN_POT)) {
+            potValOld = potValNew;
+            roofFan.fanDuty = potValOld >> 2; // convert 1023 to 255
+            printFanSpeed(&roofFan);
         }
     }
 
-    currMillis = millis();
-
+    // READ AND PRINT CURRENT TACHO VALUE 
     if (currMillis > tachoMillis + 1000) {
         tachoMillis = currMillis;
         printTacho(&tachoPulses_vol);
         tachoPulses_vol = 0; // start counting again
+    }
+
+    // SET FAN DUTY
+    if (currMillis > roofFan.dutyUpdateMillis + 1000) {
+        setFanMotorPWM(&roofFan);
     }
 }
 
@@ -191,33 +209,32 @@ void printTacho(volatile uint16_t *tachoPulses_vol_ptr) {
 
     lcd.setCursor(0,1);
     lcd.print(lcdRow1Empty);
-    lcd.setCursor(5,1);
+    lcd.setCursor(8,1);
     lcd.print(tachoPulses_non_vol);
 }
 
-void printFanSpeed(uint8_t *fanDuty_ptr) {
+void printFanSpeed(struct Fan* fan) {
     //Serial.print("Timer value: ");
     //Serial.print(TCNT2); // timer val
     Serial.print(F("Voltage value: 10bit: "));
-    Serial.print(currPotVal);
+    Serial.print(potValNew);
     Serial.print(F(", 8bit (PWM duty): "));
-    Serial.print(fanDuty); // real fan duty number 0-255
+    Serial.print(fan->fanDuty); // real fan duty number 0-255
+
+    fan->fanDutyDisplay = map(roofFan.fanDuty, 0, 255, 100, 0); // show as 0-100
     Serial.print(F(", %: "));
-    Serial.println(fanDutyDisplay);
+    Serial.println(fan->fanDutyDisplay);
 
     lcd.setCursor(8,0); // after text position
-    lcd.print(fanDutyDisplay);
-    
-    Serial.print(F("Fan duty: "));
-    Serial.println(*fanDuty_ptr);
+    lcd.print(fan->fanDutyDisplay);
 }
 
-void setFanSpeed(uint8_t fanPort, uint8_t *fanDuty_ptr) {
-    if (*fanDuty_ptr < 11) {
-        *fanDuty_ptr = 0;
+void setFanMotorPWM(struct Fan* fan) {
+    if (fan->fanDuty < 11) { // signal off at very low val
+        fan->fanDuty = 0;
     }
 
-    OCR2B = *fanDuty_ptr;
+    OCR2B = fan->fanDuty;
 }
 
 void toggleLED(int ledPort) {
